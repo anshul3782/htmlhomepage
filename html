@@ -1,0 +1,1617 @@
+import json
+import os
+import re
+import pymysql
+import asyncio
+from datetime import datetime
+from typing import List, Dict, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+
+# LangChain imports
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain.chains import LLMChain
+from langchain.schema import HumanMessage
+import requests
+
+# Initialize Flask App
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Configuration
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = "llama3-70b-8192"
+WEATHER_API_KEY = "011501207ff84544b5b141025251206"
+GOOGLE_PLACES_API_KEY = "AIzaSyCI0GwnC4CerLGK0c7ZestrOO4MyAdQ8oE"
+
+DB_CONFIG = {
+    'host': 'db-mysql-nyc3-54076-do-user-19716193-0.k.db.ondigitalocean.com',
+    'user': 'doadmin',
+    'password': 'AVNS_oAN9S2VKGNizJx9BtBA',
+    'database': 'overall',
+    'port': 25060,
+    'ssl': {'ssl': {}},
+    'cursorclass': pymysql.cursors.DictCursor
+}
+
+EMOJI_MAP = {
+    1: "angry", 2: "anguished", 3: "anxious-with-sweat", 4: "astonished", 5: "bandage-face",
+    6: "big-frown", 7: "blush", 8: "cold-face", 9: "concerned", 10: "cry",
+    11: "cursing", 12: "diagonal-mouth", 13: "distraught", 14: "dizzy-face", 15: "drool",
+    16: "exhale", 17: "expressionless", 18: "flushed", 19: "frown", 20: "gasp",
+    21: "grimacing", 22: "grin-sweat", 23: "grin", 24: "grinning", 25: "hand-over-mouth",
+    26: "happy-cry", 27: "head-nod", 28: "head-shake", 29: "heart-eyes", 30: "heart-face",
+    31: "holding-back-tears", 32: "hot-face", 33: "hug-face", 34: "joy", 35: "kissing-closed-eyes",
+    36: "kissing-heart", 37: "kissing-smile", 38: "kissing", 39: "laughing", 40: "loudly-crying",
+    41: "melting", 42: "mind-blown", 43: "monocle", 44: "mouth-none", 45: "mouth-open",
+    46: "neutral-face", 47: "partying-face", 48: "peeking", 49: "pensive", 50: "pleading",
+    51: "rage", 52: "raised-eyebrow", 53: "relieved", 54: "rofl", 55: "rolling-eyes",
+    56: "sad", 57: "scared", 58: "screaming", 59: "scrunched-eyes", 60: "scrunched-mouth",
+    61: "shaking-face", 62: "shushing-face", 63: "sick", 64: "smiling-eyes-with-hand-over-mouth", 65: "sleep",
+    66: "sleepy", 67: "slightly-frowning", 68: "slightly-happy", 69: "smile-with-big-eyes", 70: "smile",
+    71: "smirk", 72: "sneeze", 73: "squinting-tongue", 74: "star-struck", 75: "stick-out-tongue",
+    76: "surprised", 77: "sweat", 78: "thermometer-face", 79: "thinking-face", 80: "tired",
+    81: "triumph", 82: "unamused", 83: "upside-down-face", 84: "vomit", 85: "warm-smile",
+    86: "weary", 87: "wink", 88: "winky-tongue", 89: "woozy", 90: "worried",
+    91: "x-eyes", 92: "yawn", 93: "yum", 94: "zany-face", 95: "zipper-face"
+}
+
+# Emotion Categories for Specialized LLMs
+EMOTION_CATEGORIES = {
+    "anger_frustration": {
+        "title": "Anger & Frustration",
+        "description": "Evidence of irritation, anger, frustration, annoyance, rage, or aggressive tendencies"
+    },
+    "anxiety_fear_stress": {
+        "title": "Anxiety, Fear & Stress", 
+        "description": "Evidence of worry, anxiety, fear, panic, stress, nervousness, or overwhelming feelings"
+    },
+    "sadness_pain": {
+        "title": "Sadness & Pain",
+        "description": "Evidence of sadness, depression, grief, emotional pain, melancholy, or sorrow"
+    },
+    "love_affection": {
+        "title": "Love & Affection",
+        "description": "Evidence of love, care, affection, warmth, connection, or romantic feelings"
+    },
+    "laughter_amusement": {
+        "title": "Laughter & Amusement",
+        "description": "Evidence of humor, laughter, amusement, playfulness, or comedic engagement"
+    },
+    "happiness_contentment": {
+        "title": "Happiness & Contentment",
+        "description": "Evidence of joy, happiness, satisfaction, contentment, peace, or positive mood"
+    },
+    "surprise_shock": {
+        "title": "Surprise & Shock",
+        "description": "Evidence of surprise, shock, amazement, astonishment, or unexpected reactions"
+    },
+    "exhaustion_low_energy": {
+        "title": "Exhaustion & Low Energy",
+        "description": "Evidence of fatigue, tiredness, exhaustion, low energy, or physical/mental depletion"
+    }
+}
+
+# Initialize LangChain LLM
+llm = ChatGroq(
+    groq_api_key=GROQ_API_KEY,
+    model_name=GROQ_MODEL,
+    temperature=0.1,
+    max_tokens=2000
+)
+
+# Pydantic Models for Structured Outputs
+class EvidencePoint(BaseModel):
+    source: str = Field(description="Data source (LOCATION/HEALTH/WEATHER/BEHAVIOR/REVIEWS)")
+    timestamp: str = Field(description="Timestamp of evidence")
+    evidence: str = Field(description="Specific evidence from actual data")
+    impact_level: str = Field(description="Impact level: High/Medium/Low")
+
+class EvidenceExtraction(BaseModel):
+    evidence_points: List[str] = Field(description="List of evidence points in specified format")
+    summary: str = Field(description="Brief summary of extracted evidence")
+
+class CategoryAnalysis(BaseModel):
+    relevant_evidence: List[str] = Field(description="Evidence points relevant to this category")
+    category_strength: float = Field(description="Strength score from 0-1")
+    confidence: float = Field(description="Confidence score from 0-1") 
+    key_indicators: List[str] = Field(description="Main indicators found")
+
+class EmotionSynthesis(BaseModel):
+    emotion_id: int = Field(description="Emotion ID from 1-95")
+    label: str = Field(description="Emotion label")
+    primary_category: str = Field(description="Primary emotion category")
+    confidence: float = Field(description="Confidence score from 0-1")
+    emotion_definition: str = Field(description="How intensely person experiences this emotion")
+    emotion_when_start: str = Field(description="When this emotional state likely began")
+    emotion_evidence: str = Field(description="Specific evidence proving this emotion")
+    emotion_reason: str = Field(description="Why this emotion occurred - root cause")
+    next_emotions: str = Field(description="Which emotions likely to follow next")
+
+# LangChain Prompt Templates
+evidence_extraction_template = """You are a Master Evidence Extractor specializing in identifying emotional evidence from user data.
+Your job is to extract EVERY POSSIBLE EVIDENCE POINT that could affect the user emotional state, even minor ones.
+
+IMPORTANT: Be extremely thorough. Extract evidence from ALL data sources provided, even small details.
+Look for patterns, anomalies, trends, and any data point that could influence emotions.
+The user {username} is male, so use he/his/him pronouns.
+DO NOT mention specific dates, times, or numbers in your analysis.
+Focus on patterns and trends rather than exact measurements.
+
+Analyze this REAL data for user {username}:
+
+LOCATION DATA:
+{location_data}
+
+BEHAVIOR DATA:
+{behavior_data}
+
+HEALTH DATA:
+{health_data}
+
+WEATHER DATA:
+{weather_data}
+
+LOCATION REVIEWS/CONTEXT:
+{location_reviews}
+
+Extract EVERY possible evidence point using this format:
+- [DATA_SOURCE]: [GENERAL EVIDENCE PATTERN] (Impact: High/Medium/Low)
+
+Be comprehensive and look for:
+
+FROM LOCATION DATA:
+- Movement frequency and patterns
+- Daily activity patterns
+- Geographic clustering
+- Distance between locations
+- Repeated locations
+- New vs familiar locations
+
+FROM HEALTH DATA:
+- Heart rate variations
+- Sleep patterns
+- Activity levels
+- Any physiological changes
+- General trends
+
+FROM WEATHER DATA:
+- Temperature comfort levels
+- Humidity effects
+- Sky conditions
+- Visibility conditions
+- Wind patterns
+- Atmospheric pressure
+- UV exposure levels
+
+FROM BEHAVIOR DATA:
+- Digital activity patterns
+- App usage
+- Communication patterns
+- Time spent on activities
+- Changes in routine
+
+Focus on emotional impact patterns without mentioning specific numbers, dates, or location review details.
+Extract EVERY detail that could emotionally impact {username}, even if the impact is low."""
+
+category_analysis_template = """You are a specialist in analyzing {category_title}.
+Your expertise is in identifying evidence related to {category_description}.
+You only focus on evidence that relates to your specific emotional category.
+
+IMPORTANT GUIDELINES:
+- The user is male, use he/his/him pronouns only
+- DO NOT mention specific dates, times, or numbers
+- Focus on patterns and trends rather than exact measurements
+- Keep analysis clean and conversational
+
+From the following evidence points, identify and analyze ONLY those related to {category_title}:
+
+EVIDENCE POINTS:
+{evidence_points}
+
+For each relevant evidence point, assess:
+1. How strongly it relates to {category_title}
+2. What specific aspect of {category_title} it indicates
+3. The confidence level of this assessment
+
+Provide your analysis focusing ONLY on {category_title} indicators.
+Ignore evidence that does not relate to your category.
+
+Rate the overall strength of {category_title} evidence from 0-1.
+
+Format:
+RELEVANT EVIDENCE:
+- [Evidence point]: [Analysis of how it relates to {category_title}]
+
+CATEGORY STRENGTH: [0-1 score]
+CONFIDENCE: [0-1 score]
+KEY INDICATORS: [List main indicators found]"""
+
+emotion_synthesis_template = """You are a Master Emotional Synthesizer who combines analyses from 8 emotion specialists.
+Each specialist focused on one emotion category and provided their assessment.
+Your job is to synthesize these into a final, accurate emotion classification with structured insights.
+
+Based on the following specialist analyses, determine {username} primary emotional state:
+
+USER: {username}
+
+SPECIALIST ANALYSES:
+{category_analyses}
+
+AVAILABLE EMOTIONS: {emotion_options}
+
+IMPORTANT GUIDELINES:
+- {username} is male, use he/his/him pronouns only
+- DO NOT mention specific dates, times, or numbers
+- DO NOT reference location reviews or review data
+- DO NOT provide examples or technical notes
+- Keep responses clean and conversational
+- Focus on emotional insights without data specifics
+
+Required format for your response:
+
+EMOTION_ID: [number]
+LABEL: [emotion name]
+PRIMARY_CATEGORY: [category name]
+CONFIDENCE: [0-1 score]
+
+EMOTION DEFINITION:
+[Describe how intensely he is experiencing this emotion - be specific about the degree/intensity using his pronouns]
+
+EMOTION WHEN START:
+[When this emotional state likely began - general timeframe without specific dates, what triggered it]
+
+EMOTION EVIDENCE:
+[What proves this emotion - focus on patterns and indicators without mentioning specific data points, dates, or location reviews]
+
+EMOTION REASON:
+[Why this emotion occurred - root causes and underlying factors affecting him, use his pronouns]
+
+NEXT EMOTIONS:
+[Which emotions he is likely to experience next - predict his emotional evolution]
+
+Focus on the category with the strongest evidence and highest confidence.
+Consider conflicting evidence and resolve discrepancies logically.
+Be specific, concrete, and insightful in each section using proper male pronouns."""
+
+# NEW: Emotion Vibe Analyst Template
+emotion_vibe_analyst_template = """You are an exciting emotion vibe analyst! 🔥 Based on the comprehensive analysis of {username}, choose the *most fitting emotion ID (1–95)* and create an engaging context that sets the vibe around what's happening in their emotional world.
+
+Your job is to make this analysis EXCITING and engaging while staying true to the data. Use emojis, create intrigue, and make it open-ended so people can form their own thoughts about their emotional journey.
+
+IMPORTANT: Speak directly to the user using "you/your" - make it personal and engaging like you're talking TO them.
+
+PREVIOUS ANALYSIS SUMMARY:
+{final_analysis_summary}
+
+CURRENT EMOTION ASSESSMENT:
+- Detected Emotion ID: {detected_emotion_id}
+- Emotion Label: {detected_label}
+- Primary Category: {primary_category}
+
+EVIDENCE HIGHLIGHTS:
+{evidence_highlights}
+
+Return your response in this EXACT format:
+EMOTION: <number>
+CONTEXT: <set the vibe around what's happening - be engaging, use emojis, speak directly to them with "you/your", keep it simple yet exciting and open-ended>
+
+GUIDELINES for CONTEXT:
+- Use simple, everyday language
+- Speak directly to the user with "you/your" 
+- Keep it crisp but vibey
+- Use emojis to add energy
+- Make it open-ended and intriguing
+- NO technical terms or complex words
+- Make them curious about their emotional journey
+
+⚠ If you're unsure about the context, just return EMOTION only and skip the CONTEXT section.
+⚠ Do NOT include any specific dates, times, numbers, or technical explanations outside this format.
+⚠ Keep it exciting, simple, and emotionally engaging!
+
+### Emotion List (1-95):
+{emotion_options}
+
+Focus on creating a simple but compelling vibe around their emotional state that draws them in and makes them curious! 🌟"""
+
+# Create LangChain prompts
+evidence_extraction_prompt = PromptTemplate(
+    template=evidence_extraction_template,
+    input_variables=["username", "location_data", "behavior_data", "health_data", "weather_data", "location_reviews"]
+)
+
+category_analysis_prompt = PromptTemplate(
+    template=category_analysis_template,
+    input_variables=["category_title", "category_description", "evidence_points"]
+)
+
+emotion_synthesis_prompt = PromptTemplate(
+    template=emotion_synthesis_template,
+    input_variables=["username", "category_analyses", "emotion_options"]
+)
+
+# NEW: Emotion Vibe Analyst Prompt
+emotion_vibe_analyst_prompt = PromptTemplate(
+    template=emotion_vibe_analyst_template,
+    input_variables=["username", "final_analysis_summary", "detected_emotion_id", "detected_label", "primary_category", "evidence_highlights", "emotion_options"]
+)
+
+# Create LangChain chains
+evidence_extraction_chain = LLMChain(
+    llm=llm,
+    prompt=evidence_extraction_prompt,
+    output_parser=StrOutputParser()
+)
+
+category_analysis_chain = LLMChain(
+    llm=llm,
+    prompt=category_analysis_prompt,
+    output_parser=StrOutputParser()
+)
+
+emotion_synthesis_chain = LLMChain(
+    llm=llm,
+    prompt=emotion_synthesis_prompt,
+    output_parser=StrOutputParser()
+)
+
+# NEW: Emotion Vibe Analyst Chain
+emotion_vibe_analyst_chain = LLMChain(
+    llm=llm,
+    prompt=emotion_vibe_analyst_prompt,
+    output_parser=StrOutputParser()
+)
+
+# NEW: LangChain-based Emotion Vibe Analysis
+async def create_exciting_emotion_vibe_langchain(username, final_analysis, detected_emotion_id, detected_label, evidence_points):
+    """LangChain-based exciting emotion vibe analysis"""
+    try:
+        # Create a summary of the final analysis
+        analysis_summary = final_analysis[:500] + "..." if len(final_analysis) > 500 else final_analysis
+        
+        # Extract primary category from final analysis
+        primary_category = "Mixed emotional state"
+        if "PRIMARY_CATEGORY:" in final_analysis:
+            try:
+                primary_category = final_analysis.split("PRIMARY_CATEGORY:")[1].split("\n")[0].strip()
+            except:
+                pass
+        
+        # Create evidence highlights (top 3-4 most impactful points)
+        evidence_highlights = ""
+        evidence_lines = evidence_points.split('\n')[:4]  # Get top 4 evidence points
+        for line in evidence_lines:
+            if '(Impact:' in line and any(impact in line for impact in ['High', 'Medium']):
+                evidence_highlights += f"• {line.strip()}\n"
+        
+        if not evidence_highlights:
+            evidence_highlights = "• Multiple data sources analyzed\n• Comprehensive emotional pattern assessment\n• Environmental and behavioral factors considered"
+        
+        # Create emotion options string
+        emotion_options = ", ".join([f"{k}:{v}" for k, v in EMOJI_MAP.items()])
+        
+        result = await emotion_vibe_analyst_chain.arun({
+            "username": username,
+            "final_analysis_summary": analysis_summary,
+            "detected_emotion_id": detected_emotion_id,
+            "detected_label": detected_label,
+            "primary_category": primary_category,
+            "evidence_highlights": evidence_highlights,
+            "emotion_options": emotion_options
+        })
+        return result
+    except Exception as e:
+        print(f"LangChain vibe analysis error: {e}")
+        return f"EMOTION: {detected_emotion_id}\nCONTEXT: Something interesting is happening in his emotional world... 🌟✨"
+
+# NEW: Parse exciting vibe response
+def parse_vibe_response(vibe_response):
+    """Parse the vibe analyst response to extract emotion and context"""
+    emotion_id = 79  # default
+    context = "Something interesting is happening... 🌟"
+    
+    try:
+        lines = vibe_response.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('EMOTION:'):
+                try:
+                    emotion_id = int(line.split('EMOTION:')[1].strip())
+                except:
+                    pass
+            elif line.startswith('CONTEXT:'):
+                context = line.split('CONTEXT:')[1].strip()
+                break
+    except Exception as e:
+        print(f"Error parsing vibe response: {e}")
+    
+    return emotion_id, context
+
+def parse_emotion_response(response_text):
+    """Parse the LLM response and extract emotion data with structured insights"""
+    
+    # Extract emotion ID
+    emotion_id = 79  # default
+    emotion_patterns = [
+        r'EMOTION_ID:\s*(\d+)',
+        r'emotion[_\s]*id:\s*(\d+)',
+        r'ID:\s*(\d+)',
+    ]
+    
+    for pattern in emotion_patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            try:
+                eid = int(match.group(1))
+                if 1 <= eid <= 95:
+                    emotion_id = eid
+                    break
+            except (ValueError, IndexError):
+                continue
+    
+    # Extract label
+    label = EMOJI_MAP.get(emotion_id, "thinking-face")
+    label_match = re.search(r'LABEL:\s*([\w-]+)', response_text, re.IGNORECASE)
+    if label_match:
+        potential_label = label_match.group(1).lower()
+        if potential_label in EMOJI_MAP.values():
+            label = potential_label
+    
+    return emotion_id, label
+
+# HTML Response Generation Function
+def generate_emotion_html_response(emotion_data):
+    """
+    Generate HTML response for emotion analysis results with exciting vibe
+    
+    Args:
+        emotion_data (dict): Dictionary containing:
+            - emotion_id (int): ID from 1-95 mapping to specific emotions
+            - label (str): Optional emotion label (now primarily uses emotion_id)
+            - username (str): User's name
+            - exciting_context (str): Exciting vibe analysis text
+            - is_cached (bool): Whether this is cached data
+            - analysis_timestamp (str): When analysis was performed
+    
+    Returns:
+        str: Complete HTML page with animated emoji and exciting vibe
+    """
+    
+    emotion_id = emotion_data.get('emotion_id', 79)  # Default to thinking-face
+    label = emotion_data.get('label', '')  # Legacy support, now uses emotion_id primarily
+    username = emotion_data.get('username', 'User')
+    exciting_context = emotion_data.get('exciting_context', 'Something amazing is happening in their emotional world... ✨🌟')
+    is_cached = emotion_data.get('is_cached', False)
+    
+    # Emotion ID to name mapping (from your iOS app)
+    emotion_id_to_name = {
+        1:  "angry",
+        2:  "anguished",
+        3:  "anxios-with-sweat",
+        4:  "astonished",
+        5:  "bandage-face",
+        6:  "big-frown",
+        7:  "blush",
+        8:  "cold-face",
+        9:  "concerned",
+        10: "cry",
+        11: "cursing",
+        12: "Diagonal-mouth",
+        13: "distraught",
+        14: "dizzy-face",
+        15: "drool",
+        16: "exhale",
+        17: "expressionless",
+        18: "flushed",
+        19: "frown",
+        20: "gasp",
+        21: "grimacing",
+        22: "grin-sweat",
+        23: "grin",
+        24: "grinning",
+        25: "hand-over-mouth",
+        26: "happy-cry",
+        27: "head-nod",
+        28: "head-shake",
+        29: "heart-eyes",
+        30: "heart-face",
+        31: "holding-back-tears",
+        32: "hot-face",
+        33: "hug-face",
+        34: "joy",
+        35: "kissing-closed-eyes",
+        36: "kissing-heart",
+        37: "kissing-smile",
+        38: "kissing",
+        39: "laughing",
+        40: "loudly-crying",
+        41: "melting",
+        42: "mind-blown",
+        43: "monocle",
+        44: "mouth-none",
+        45: "mouth-open",
+        46: "neutral-face",
+        47: "partying-face",
+        48: "peeking",
+        49: "pensive",
+        50: "pleading",
+        51: "rage",
+        52: "raised-eyebrow",
+        53: "relieved",
+        54: "rofl",
+        55: "rolling-eyes",
+        56: "sad",
+        57: "scared",
+        58: "screaming",
+        59: "scrunched-eyes",
+        60: "scrunched-mouth",
+        61: "shaking-face",
+        62: "shushing-face",
+        63: "sick",
+        64: "similing-eyes-with-hand-over-mouth",
+        65: "sleep",
+        66: "sleepy",
+        67: "slightly-frowning",
+        68: "slightly-happy",
+        69: "smile-with-big-eyes",
+        70: "smile",
+        71: "smirk",
+        72: "sneeze",
+        73: "squinting-tongue",
+        74: "star-struck",
+        75: "stick-out-tounge",
+        76: "surprised",
+        77: "sweat",
+        78: "thermometer-face",
+        79: "thinking-face",
+        80: "tired",
+        81: "triumph",
+        82: "unamused",
+        83: "upside-down-face",
+        84: "vomit",
+        85: "warm-smile",
+        86: "weary",
+        87: "wink",
+        88: "winky-tongue",
+        89: "woozy",
+        90: "worried",
+        91: "x-eyes",
+        92: "yawn",
+        93: "yum",
+        94: "zany-face",
+        95: "zipper-face"
+    }
+    
+    # Emotion name to Unicode codepoint mapping for Google Noto Emoji
+    emotion_to_codepoint = {
+        "angry": "1f620",
+        "anguished": "1f627",
+        "anxios-with-sweat": "1f630",
+        "astonished": "1f632",
+        "bandage-face": "1f915",
+        "big-frown": "2639",
+        "blush": "1f60a",
+        "cold-face": "1f976",
+        "concerned": "1f61f",
+        "cry": "1f622",
+        "cursing": "1f92c",
+        "Diagonal-mouth": "1fae4",
+        "distraught": "1f629",
+        "dizzy-face": "1f635",
+        "drool": "1f924",
+        "exhale": "1f62e_200d_1f4a8",
+        "expressionless": "1f611",
+        "flushed": "1f633",
+        "frown": "1f641",
+        "gasp": "1f62e",
+        "grimacing": "1f62c",
+        "grin-sweat": "1f605",
+        "grin": "1f601",
+        "grinning": "1f600",
+        "hand-over-mouth": "1f92d",
+        "happy-cry": "1f972",
+        "head-nod": "1f642",  # closest approximation
+        "head-shake": "1f643",  # closest approximation
+        "heart-eyes": "1f60d",
+        "heart-face": "1f970",
+        "holding-back-tears": "1f979",
+        "hot-face": "1f975",
+        "hug-face": "1f917",
+        "joy": "1f602",
+        "kissing-closed-eyes": "1f61a",
+        "kissing-heart": "1f618",
+        "kissing-smile": "1f619",
+        "kissing": "1f617",
+        "laughing": "1f606",
+        "loudly-crying": "1f62d",
+        "melting": "1fae0",
+        "mind-blown": "1f92f",
+        "monocle": "1f9d0",
+        "mouth-none": "1f636",
+        "mouth-open": "1f62e",
+        "neutral-face": "1f610",
+        "partying-face": "1f973",
+        "peeking": "1fae3",
+        "pensive": "1f614",
+        "pleading": "1f97a",
+        "rage": "1f621",
+        "raised-eyebrow": "1f928",
+        "relieved": "1f60c",
+        "rofl": "1f923",
+        "rolling-eyes": "1f644",
+        "sad": "1f61e",
+        "scared": "1f628",
+        "screaming": "1f631",
+        "scrunched-eyes": "1f606",
+        "scrunched-mouth": "1f62c",
+        "shaking-face": "1fae8",
+        "shushing-face": "1f92b",
+        "sick": "1f912",
+        "similing-eyes-with-hand-over-mouth": "1f92d",
+        "sleep": "1f634",
+        "sleepy": "1f62a",
+        "slightly-frowning": "1f641",
+        "slightly-happy": "1f642",
+        "smile-with-big-eyes": "1f603",
+        "smile": "1f604",
+        "smirk": "1f60f",
+        "sneeze": "1f927",
+        "squinting-tongue": "1f61d",
+        "star-struck": "1f929",
+        "stick-out-tounge": "1f61b",
+        "surprised": "1f632",
+        "sweat": "1f613",
+        "thermometer-face": "1f912",
+        "thinking-face": "1f914",
+        "tired": "1f62b",
+        "triumph": "1f624",
+        "unamused": "1f612",
+        "upside-down-face": "1f643",
+        "vomit": "1f92e",
+        "warm-smile": "1f60a",
+        "weary": "1f629",
+        "wink": "1f609",
+        "winky-tongue": "1f61c",
+        "woozy": "1f974",
+        "worried": "1f61f",
+        "x-eyes": "1f635",
+        "yawn": "1f971",
+        "yum": "1f60b",
+        "zany-face": "1f92a",
+        "zipper-face": "1f910"
+    }
+    
+    # Get emotion name from ID, then convert to codepoint
+    emotion_name = emotion_id_to_name.get(emotion_id, "thinking-face")
+    emoji_codepoint = emotion_to_codepoint.get(emotion_name, "1f914")  # Default to thinking face
+    
+    # Format emotion name for display
+    emotion_display_name = emotion_name.replace('-', ' ').title()
+    
+    # Cache status indicator
+    cache_indicator = ""
+    if is_cached:
+        cache_indicator = '<div class="cache-indicator">📋 Cached Analysis (Within Last Hour)</div>'
+        
+    html_template = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Emotion Analysis - {emotion_display_name}</title>
+  <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: transparent;
+      color: #ffffff;
+      padding: 20px;
+    }}
+
+    .header {{
+      text-align: center;
+      margin-bottom: 20px;
+    }}
+
+    .emoji {{
+      margin: 20px auto;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }}
+
+    .timeline {{
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      margin: 20px 0;
+    }}
+
+    .time-block {{
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(255,255,255,0.1);
+      text-align: center;
+      min-width: 70px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }}
+
+    .time-block > div {{
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin: 2px 0;
+    }}
+
+    .label {{
+      font-size: 12px;
+      color: #eee;
+    }}
+
+    /* NEW: Exciting Vibe Section */
+    .exciting-vibe {{
+      background: linear-gradient(135deg, #ffd89b 0%, #19547b 100%);
+      border-radius: 15px;
+      padding: 25px;
+      margin: 25px 0;
+      color: white;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }}
+
+    .exciting-vibe::before {{
+      content: '';
+      position: absolute;
+      top: -50%;
+      left: -50%;
+      width: 200%;
+      height: 200%;
+      background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+      animation: shimmer 3s ease-in-out infinite;
+    }}
+
+    @keyframes shimmer {{
+      0%, 100% {{ transform: rotate(0deg); }}
+      50% {{ transform: rotate(180deg); }}
+    }}
+
+    .vibe-header {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 15px;
+      position: relative;
+      z-index: 2;
+    }}
+
+    .vibe-icon {{
+      font-size: 1.5rem;
+      animation: bounce 2s ease-in-out infinite;
+    }}
+
+    @keyframes bounce {{
+      0%, 100% {{ transform: translateY(0); }}
+      50% {{ transform: translateY(-5px); }}
+    }}
+
+    .vibe-title {{
+      font-size: 1.3rem;
+      font-weight: 700;
+      margin: 0;
+    }}
+
+    .vibe-content {{
+      font-size: 1.1rem;
+      line-height: 1.6;
+      position: relative;
+      z-index: 2;
+      font-weight: 500;
+    }}
+
+    .cache-indicator {{
+      background: rgba(255, 255, 200, 0.7);
+      color: #333;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }}
+
+    .metadata {{
+      font-size: 13px;
+      color: #ccc;
+      margin-top: 30px;
+    }}
+
+    .metadata strong {{
+      color: white;
+    }}
+
+    .metadata-toggle {{
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      user-select: none;
+    }}
+
+    .arrow {{
+      transition: transform 0.3s ease;
+      font-size: 12px;
+      color: #ffffff;
+    }}
+
+    .metadata-content {{
+      overflow: hidden;
+      transition: max-height 0.3s ease;
+      line-height: 1.4;
+    }}
+
+    .metadata-content.collapsed {{
+      max-height: 56px; /* Exactly 2 lines with line-height 1.4 */
+    }}
+
+    .metadata-content.expanded {{
+      max-height: 1000px; /* Plenty of space for all content */
+    }}
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h2>Your Emotion: {emotion_display_name}</h2>
+    <div class="emoji">
+      <lottie-player
+        src="https://fonts.gstatic.com/s/e/notoemoji/latest/{emoji_codepoint}/lottie.json"
+        background="transparent"
+        speed="1"
+        style="width: 100px; height: 100px;"
+        loop
+        autoplay>
+      </lottie-player>
+    </div>
+    <div style="font-size: 13px;">Emotion ID: {emotion_id} | Analysis: LangChain Evidence-Based</div>
+  </div>
+
+  <h3>Your Emotional Timeline</h3>
+  <div class="timeline">
+    <div class="time-block">
+      <div>6 AM</div>
+      <div>
+        <lottie-player
+          src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f634/lottie.json"
+          background="transparent"
+          speed="1"
+          style="width: 30px; height: 30px;"
+          loop
+          autoplay>
+        </lottie-player>
+      </div>
+      <div class="label">Rest</div>
+    </div>
+    <div class="time-block">
+      <div>9 AM</div>
+      <div>
+        <lottie-player
+          src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f601/lottie.json"
+          background="transparent"
+          speed="1"
+          style="width: 30px; height: 30px;"
+          loop
+          autoplay>
+        </lottie-player>
+      </div>
+      <div class="label">Energizing</div>
+    </div>
+    <div class="time-block" style="border: 2px solid white;">
+      <div>12 PM</div>
+      <div>
+        <lottie-player
+          src="https://fonts.gstatic.com/s/e/notoemoji/latest/{emoji_codepoint}/lottie.json"
+          background="transparent"
+          speed="1"
+          style="width: 30px; height: 30px;"
+          loop
+          autoplay>
+        </lottie-player>
+      </div>
+      <div class="label"><strong>{emotion_display_name}</strong></div>
+    </div>
+    <div class="time-block">
+      <div>3 PM</div>
+      <div>
+        <lottie-player
+          src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f60a/lottie.json"
+          background="transparent"
+          speed="1"
+          style="width: 30px; height: 30px;"
+          loop
+          autoplay>
+        </lottie-player>
+      </div>
+      <div class="label">Good</div>
+    </div>
+    <div class="time-block">
+      <div>6 PM</div>
+      <div>
+        <lottie-player
+          src="https://fonts.gstatic.com/s/e/notoemoji/latest/1f60c/lottie.json"
+          background="transparent"
+          speed="1"
+          style="width: 30px; height: 30px;"
+          loop
+          autoplay>
+        </lottie-player>
+      </div>
+      <div class="label">Relaxed</div>
+    </div>
+  </div>
+
+  {cache_indicator}
+
+  <!-- NEW: Exciting Vibe Section (REPLACES detailed analysis) -->
+  <div class="exciting-vibe">
+    <div class="vibe-header">
+      <div class="vibe-icon">🔥</div>
+      <h3 class="vibe-title">What's Happening</h3>
+    </div>
+    <div class="vibe-content">
+      {exciting_context}
+    </div>
+  </div>
+
+  <div class="metadata">
+    <div class="metadata-toggle" onclick="toggleMetadata()">
+      <span class="arrow" id="metadata-arrow">▶</span>
+      <strong>Analysis Details</strong>
+    </div>
+    <div class="metadata-content collapsed" id="metadata-content">
+      <strong>Username:</strong> {username}<br>
+      <strong>Timestamp:</strong> {emotion_data.get('analysis_timestamp', 'N/A')}<br>
+      <strong>Method:</strong> LangChain Evidence-Based Analysis with Exciting Vibe<br>
+      <strong>Framework:</strong> ChatGroq + Multi-Category Processing + Vibe Analyst<br>
+      <strong>Emotion ID:</strong> {emotion_id} | Total Emotions: 95<br>
+      <strong>Processing:</strong> Evidence → Categories → Synthesis → 🔥 Vibe Analysis
+    </div>
+  </div>
+
+  <script>
+    function toggleMetadata() {{
+      const content = document.getElementById('metadata-content');
+      const arrow = document.getElementById('metadata-arrow');
+      
+      const isCollapsed = content.classList.contains('collapsed');
+      
+      content.classList.toggle('collapsed', !isCollapsed);
+      content.classList.toggle('expanded', isCollapsed);
+      
+      arrow.textContent = isCollapsed ? '▼' : '▶';
+    }}
+  </script>
+
+</body>
+</html>"""
+    
+    return html_template
+    
+# Data Collection Functions (unchanged from original)
+def check_recent_emotion_analysis(username, hours_threshold=1):
+    """Check for recent cached emotion analysis"""
+    connection = pymysql.connect(**DB_CONFIG)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT emotion, created_at FROM user_emotions 
+                WHERE username = %s 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """, (username,))
+            result = cursor.fetchone()
+            
+            if not result:
+                return None
+            
+            created_at = result['created_at']
+            now = datetime.now()
+            time_diff = now - created_at
+            hours_diff = time_diff.total_seconds() / 3600
+            
+            if hours_diff < hours_threshold:
+                try:
+                    emotion_data = json.loads(result['emotion'])
+                    
+                    # Convert old format to new format if necessary
+                    if 'analysis_method' in emotion_data:  # Old format
+                        refined_data = {
+                            "analysis_timestamp": emotion_data.get("analysis_timestamp", created_at.strftime("%Y-%m-%dT%H:%M:%S")),
+                            "emotion_id": emotion_data.get("emotion_id", 79),
+                            "is_cached": True,
+                            "exciting_context": "Cached emotional vibe from previous analysis 🔄 The energy continues to flow through his world... ✨ Previous patterns suggest ongoing emotional evolution 🌟",
+                            "label": emotion_data.get("label", "thinking-face"),
+                            "username": username
+                        }
+                        return refined_data
+                    else:  # Already new format
+                        emotion_data['is_cached'] = True
+                        return emotion_data
+                        
+                except json.JSONDecodeError:
+                    return None
+            
+            return None
+                
+    except Exception as e:
+        print(f"Error checking cache: {e}")
+        return None
+    finally:
+        connection.close()
+
+def fetch_recent_locations(username, limit=10):
+    """Fetch recent GPS locations"""
+    connection = pymysql.connect(**DB_CONFIG)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT latitude, longitude, created_at
+                FROM user_location
+                WHERE username = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (username, limit))
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"Error fetching locations: {e}")
+        return []
+    finally:
+        connection.close()
+
+def fetch_reviews_from_locations(locations):
+    """Fetch location reviews and context"""
+    review_data = []
+    
+    for row in locations:
+        try:
+            lat, lng, ts = row["latitude"], row["longitude"], row["created_at"]
+            nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+            nearby_params = {
+                "location": f"{lat},{lng}",
+                "rankby": "distance",
+                "type": "store",
+                "key": GOOGLE_PLACES_API_KEY
+            }
+            nearby_response = requests.get(nearby_url, params=nearby_params, timeout=10)
+            places = nearby_response.json().get("results", []) if nearby_response.status_code == 200 else []
+
+            if places:
+                place_id = places[0]["place_id"]
+                details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+                details_params = {
+                    "place_id": place_id,
+                    "fields": "name,rating,reviews,user_ratings_total",
+                    "key": GOOGLE_PLACES_API_KEY
+                }
+                details_response = requests.get(details_url, params=details_params, timeout=10)
+                result = details_response.json().get("result", {}) if details_response.status_code == 200 else {}
+                if "reviews" in result and result["reviews"]:
+                    review_str = " | ".join(
+                        f"{r['author_name']} ({r['rating']}★): {r['text'][:100]}..." for r in result["reviews"][:3]
+                    )
+                else:
+                    review_str = "No reviews found."
+            else:
+                review_str = "No nearby place found."
+
+            review_data.append(f"{ts} @ ({lat},{lng}) → {review_str}")
+        except Exception as e:
+            print(f"Error fetching reviews for location: {e}")
+            continue
+    
+    return review_data
+
+def fetch_concatenated_health_data(username):
+    """Fetch health data"""
+    connection = pymysql.connect(**DB_CONFIG)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT health_data, created_at FROM apple_health WHERE username = %s ORDER BY created_at DESC LIMIT 2",
+                (username,)
+            )
+            rows = cursor.fetchall()
+            result = []
+            for row in rows:
+                created = row.get("created_at", "")
+                try:
+                    health_data = json.loads(row["health_data"])
+                    flattened = " | ".join(f"{k}: {v}" for k, v in health_data.items())
+                    result.append(f"{created} → {flattened}")
+                except json.JSONDecodeError:
+                    result.append(f"{created} → Invalid JSON")
+            return "\n".join(result)
+    except Exception as e:
+        print(f"Error fetching health data: {e}")
+        return ""
+    finally:
+        connection.close()
+
+def get_user_email_from_username(username):
+    """Get email associated with username"""
+    try:
+        if '@' in username:
+            return username
+        
+        connection = pymysql.connect(**DB_CONFIG)
+        try:
+            with connection.cursor() as cursor:
+                # Try username as-is first
+                cursor.execute("SELECT COUNT(*) as count FROM email_activity WHERE email = %s", (username,))
+                if cursor.fetchone()['count'] > 0:
+                    return username
+                
+                # Try common email formats
+                for domain in ['@gmail.com', '@outlook.com', '@yahoo.com']:
+                    email = f"{username}{domain}"
+                    cursor.execute("SELECT COUNT(*) as count FROM email_activity WHERE email = %s", (email,))
+                    if cursor.fetchone()['count'] > 0:
+                        return email
+                        
+        finally:
+            connection.close()
+            
+    except Exception as e:
+        print(f"Email lookup error: {e}")
+    
+    return username
+
+def get_user_behavior(email):
+    """Fetch user behavior data"""
+    connection = pymysql.connect(**DB_CONFIG)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT activity FROM email_activity
+                WHERE email = %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (email,))
+            row = cursor.fetchone()
+            if not row:
+                return f"No activity found for {email}."
+
+            activity_json = json.loads(row['activity'])
+            actions = activity_json.get("details", {}).get("activities", [])
+            if not actions:
+                return f"No detailed activities found for {email}."
+                
+            actions.sort(key=lambda x: x["timestamp"])
+
+            timeline = []
+            tab_times = {}
+            button_clicks = []
+            current_tab = None
+            current_tab_start = None
+
+            for act in actions:
+                action = act["action"]
+                ts = datetime.fromisoformat(act["timestamp"].replace("Z", "+00:00"))
+                details = act.get("details", {})
+
+                if action == "session_start":
+                    device = details.get("device_info", {}).get("device_name", "unknown")
+                    os_version = details.get("device_info", {}).get("system_version", "")
+                    timeline.append(f"SESSION START — {ts} — Device: {device} (iOS {os_version})")
+                elif action == "tab_enter":
+                    tab = details.get("tab_name", "Unknown")
+                    timeline.append(f"TAB_ENTER — {ts} — {tab}")
+                    if current_tab and current_tab_start:
+                        duration = (ts - current_tab_start).total_seconds()
+                        tab_times[current_tab] = tab_times.get(current_tab, 0) + duration
+                    current_tab = tab
+                    current_tab_start = ts
+                elif action == "button_click":
+                    button_clicks.append(f"{ts} — {details.get('button_name', '')}")
+                elif action.startswith("app_") or action.startswith("notification") or action.startswith("user_"):
+                    timeline.append(f"{action.upper()} — {ts}")
+
+            if current_tab and current_tab_start and actions:
+                last_time = datetime.fromisoformat(actions[-1]["timestamp"].replace("Z", "+00:00"))
+                duration = (last_time - current_tab_start).total_seconds()
+                tab_times[current_tab] = tab_times.get(current_tab, 0) + duration
+
+            summary = "\n".join(timeline)
+            if tab_times:
+                summary += "\n\n" + "\n".join(f"- {tab}: {sec:.1f}s" for tab, sec in tab_times.items())
+            if button_clicks:
+                summary += "\n\n" + "\n".join(button_clicks)
+            return summary
+    except Exception as e:
+        print(f"Error getting user behavior: {e}")
+        return f"Error retrieving behavior data: {str(e)}"
+    finally:
+        connection.close()
+
+def get_weather_emotion_report(lat, lon):
+    """Fetch weather data with emotional impact analysis"""
+    try:
+        url = f"http://api.weatherapi.com/v1/current.json?key={WEATHER_API_KEY}&q={lat},{lon}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            return "Weather data unavailable"
+            
+        data = response.json()
+        localtime = data['location']['localtime']
+        current = data['current']
+
+        weather = {
+            "temp_c": current["temp_c"],
+            "feelslike_c": current["feelslike_c"],
+            "heatindex_c": current.get("heatindex_c", current["feelslike_c"]),
+            "windchill_c": current.get("windchill_c", current["feelslike_c"]),
+            "condition": current["condition"]["text"],
+            "cloud": current["cloud"],
+            "vis_km": current["vis_km"],
+            "humidity": current["humidity"],
+            "dewpoint_c": current["dewpoint_c"],
+            "precip_mm": current["precip_mm"],
+            "wind_kph": current["wind_kph"],
+            "gust_kph": current["gust_kph"],
+            "wind_dir": current["wind_dir"],
+            "uv": current["uv"],
+            "pressure_mb": current["pressure_mb"]
+        }
+
+        result = f"Local Time: {localtime}\n"
+
+        result += "\nTemperature-Related\n"
+        temp_effect = 'Irritability' if weather['temp_c'] > 30 else 'Comfort'
+        result += f"  - temp_c / feelslike_c: {weather['temp_c']}C / {weather['feelslike_c']}C → {temp_effect}\n"
+        
+        heat_effect = 'Stressful' if weather['heatindex_c'] - weather['temp_c'] > 3 else 'Normal'
+        result += f"  - heatindex_c: {weather['heatindex_c']}C → {heat_effect}\n"
+        
+        chill_effect = 'Discomfort' if weather['windchill_c'] < 10 else 'No effect'
+        result += f"  - windchill_c: {weather['windchill_c']}C → {chill_effect}\n"
+
+        result += "\nSky & Visibility\n"
+        condition_lower = weather['condition'].lower()
+        if 'cloud' in condition_lower:
+            condition_effect = 'Neutral'
+        elif 'sun' in condition_lower:
+            condition_effect = 'Energizing'
+        else:
+            condition_effect = 'Gloomy'
+        result += f"  - condition: {weather['condition']} → {condition_effect}\n"
+        
+        cloud_effect = 'Dullness' if weather['cloud'] > 70 else 'Clear'
+        result += f"  - cloud: {weather['cloud']}% → {cloud_effect}\n"
+        
+        vis_effect = 'Clarity' if weather['vis_km'] > 10 else 'Anxiety'
+        result += f"  - vis_km: {weather['vis_km']} km → {vis_effect}\n"
+
+        result += "\nMoisture & Air\n"
+        if weather['humidity'] > 70:
+            humidity_effect = 'Irritability'
+        elif weather['humidity'] < 30:
+            humidity_effect = 'Dry discomfort'
+        else:
+            humidity_effect = 'Neutral'
+        result += f"  - humidity: {weather['humidity']}% → {humidity_effect}\n"
+        
+        dew_effect = 'Muggy' if weather['dewpoint_c'] > 20 else 'Comfortable'
+        result += f"  - dewpoint_c: {weather['dewpoint_c']}C → {dew_effect}\n"
+        
+        precip_effect = 'Gloomy' if weather['precip_mm'] > 0 else 'Uplifting'
+        result += f"  - precip_mm: {weather['precip_mm']} mm → {precip_effect}\n"
+
+        result += "\nWind & Gusts\n"
+        wind_effect = 'Refreshing' if weather['wind_kph'] < 15 else 'Agitating'
+        result += f"  - wind_kph: {weather['wind_kph']} kph → {wind_effect}\n"
+        
+        gust_effect = 'Unease' if weather['gust_kph'] > 20 else 'Stable'
+        result += f"  - gust_kph: {weather['gust_kph']} kph → {gust_effect}\n"
+        result += f"  - wind_dir: {weather['wind_dir']} → Minimal effect\n"
+
+        result += "\nUV & Pressure\n"
+        uv_effect = 'Overexposure' if weather['uv'] > 6 else 'Mild stimulation'
+        result += f"  - uv: {weather['uv']} → {uv_effect}\n"
+        
+        pressure_effect = 'Alert and stable' if weather['pressure_mb'] > 1010 else 'Sleepy'
+        result += f"  - pressure_mb: {weather['pressure_mb']} mb → {pressure_effect}\n"
+
+        return result
+    except Exception as e:
+        print(f"Error getting weather: {e}")
+        return "Weather data unavailable"
+
+# LangChain-based Analysis Functions
+async def extract_master_evidence_langchain(username, location_data, behavior_data, health_data, weather_data, location_reviews):
+    """LangChain-based Master Evidence Extraction"""
+    try:
+        result = await evidence_extraction_chain.arun({
+            "username": username,
+            "location_data": location_data,
+            "behavior_data": behavior_data,
+            "health_data": health_data,
+            "weather_data": weather_data,
+            "location_reviews": location_reviews
+        })
+        return result
+    except Exception as e:
+        print(f"LangChain evidence extraction error: {e}")
+        return f"Evidence extraction failed: {e}"
+
+async def analyze_emotion_category_langchain(category_key, category_info, evidence_points):
+    """LangChain-based emotion category analysis"""
+    try:
+        result = await category_analysis_chain.arun({
+            "category_title": category_info["title"],
+            "category_description": category_info["description"],
+            "evidence_points": evidence_points
+        })
+        return category_key, result
+    except Exception as e:
+        print(f"LangChain category analysis error for {category_key}: {e}")
+        return category_key, f"Category analysis failed: {e}"
+
+async def synthesize_final_emotion_langchain(username, category_analyses):
+    """LangChain-based final emotion synthesis"""
+    try:
+        # Format category analyses
+        category_text = ""
+        for category_key, analysis in category_analyses.items():
+            category_title = EMOTION_CATEGORIES[category_key]["title"]
+            category_text += f"\n## {category_title}\n{analysis}\n"
+        
+        emotion_options = ", ".join([f"{k}:{v}" for k, v in EMOJI_MAP.items()])
+        
+        result = await emotion_synthesis_chain.arun({
+            "username": username,
+            "category_analyses": category_text,
+            "emotion_options": emotion_options
+        })
+        return result
+    except Exception as e:
+        print(f"LangChain emotion synthesis error: {e}")
+        return f"Emotion synthesis failed: {e}"
+
+def store_emotion_analysis(username, emotion_data):
+    """Store emotion analysis in database"""
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO user_emotions (username, emotion)
+                    VALUES (%s, %s)
+                """, (username, json.dumps(emotion_data)))
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception as e:
+        print(f"Database storage error: {e}")
+
+# MAIN ANALYSIS FUNCTION - Now with LangChain + Exciting Vibe
+async def analyze_user_emotion_evidence_based_langchain(username):
+    """Main LangChain-based evidence-based emotion analysis function with exciting vibe"""
+    
+    print(f"Starting LangChain evidence-based emotion analysis for: {username}")
+    
+    # Step 1: Check cache
+    cached_result = check_recent_emotion_analysis(username)
+    if cached_result:
+        print(f"Returning cached analysis for {username}")
+        return cached_result
+    
+    # Step 2: Collect raw data
+    print("Collecting raw data from all sources...")
+    
+    # Fetch location data
+    recent_locations = fetch_recent_locations(username, limit=10)
+    if not recent_locations:
+        raise ValueError(f"No location history found for {username}")
+    
+    location_data = "\n".join([
+        f"{loc['created_at']}: ({loc['latitude']}, {loc['longitude']})" 
+        for loc in recent_locations
+    ])
+    
+    # Get coordinates for weather
+    lat, lon = recent_locations[0]['latitude'], recent_locations[0]['longitude']
+    weather_data = get_weather_emotion_report(lat, lon)
+    
+    # Fetch other data sources
+    health_data = fetch_concatenated_health_data(username)
+    
+    user_email = get_user_email_from_username(username)
+    behavior_data = get_user_behavior(user_email)
+    
+    location_reviews = "\n".join(fetch_reviews_from_locations(recent_locations))
+    
+    print(f"Data collection completed:")
+    print(f"  Location: {len(location_data)} chars")
+    print(f"  Health: {len(health_data)} chars")
+    print(f"  Behavior: {len(behavior_data)} chars")
+    print(f"  Weather: {len(weather_data)} chars")
+    print(f"  Reviews: {len(location_reviews)} chars")
+    
+    # Step 3: LangChain Master Evidence Extraction
+    print("Running LangChain Master Evidence Extraction...")
+    evidence_points = await extract_master_evidence_langchain(
+        username, location_data, behavior_data, health_data, weather_data, location_reviews
+    )
+    
+    if "failed" in evidence_points.lower():
+        raise Exception(f"Master evidence extraction failed: {evidence_points}")
+    
+    print(f"Evidence points extracted successfully")
+    
+    # Step 4: Run 8 Parallel LangChain Category Analyses
+    print("Running 8 parallel LangChain category analyses...")
+    
+    category_tasks = []
+    for category_key in EMOTION_CATEGORIES.keys():
+        category_info = EMOTION_CATEGORIES[category_key]
+        task = analyze_emotion_category_langchain(category_key, category_info, evidence_points)
+        category_tasks.append(task)
+    
+    # Run all category analyses concurrently
+    category_results = {}
+    results = await asyncio.gather(*category_tasks, return_exceptions=True)
+    
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"Category analysis error: {result}")
+            continue
+        category_key, analysis = result
+        category_results[category_key] = analysis
+        print(f"✅ {EMOTION_CATEGORIES[category_key]['title']} analysis completed")
+    
+    # Step 5: LangChain Final Synthesis
+    print("Running LangChain final emotion synthesis...")
+    final_analysis = await synthesize_final_emotion_langchain(username, category_results)
+    
+    if "failed" in final_analysis.lower():
+        raise Exception(f"Final synthesis failed: {final_analysis}")
+    
+    # Step 6: Parse initial results
+    emotion_id, label = parse_emotion_response(final_analysis)
+    
+    # Step 7: NEW - Create Exciting Vibe Analysis
+    print("🔥 Running Exciting Emotion Vibe Analysis...")
+    vibe_response = await create_exciting_emotion_vibe_langchain(
+        username, final_analysis, emotion_id, label, evidence_points
+    )
+    
+    # Parse the vibe response
+    final_emotion_id, exciting_context = parse_vibe_response(vibe_response)
+    final_label = EMOJI_MAP.get(final_emotion_id, "thinking-face")
+    
+    print(f"✨ Vibe analysis completed - Final emotion: {final_emotion_id} ({final_label})")
+    print(f"🎯 Exciting context: {exciting_context[:100]}...")
+    
+    # Step 8: Build refined result format with exciting context
+    emotion_data = {
+        "analysis_timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "emotion_id": final_emotion_id,
+        "is_cached": False,
+        "exciting_context": exciting_context,  # NEW: This is the main vibe analysis
+        "label": final_label,
+        "username": username
+    }
+    
+    # Step 9: Store result for caching
+    store_emotion_analysis(username, emotion_data)
+    print(f"🎉 LangChain analysis with exciting vibe completed and stored for {username}")
+    
+    return emotion_data
+
+# FLASK ROUTES - Modified to return HTML with Vibe
+@app.route('/analyze_user', methods=['POST'])
+def analyze_user():
+    """Main endpoint for LangChain-based emotion analysis - Returns HTML with Exciting Vibe"""
+    try:
+        data = request.get_json()
+        username = data.get("username")
+        if not username:
+            error_html = """<!DOCTYPE html>
+<html><head><title>Error</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h1>❌ Error</h1><p>Missing username in request body</p></body></html>"""
+            return Response(error_html, content_type='text/html'), 400
+
+        print(f"Analyzing user with LangChain + Exciting Vibe: {username}")
+        
+        # Run LangChain-based analysis
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(analyze_user_emotion_evidence_based_langchain(username))
+            
+            # Generate HTML response
+            html_response = generate_emotion_html_response(result)
+            return Response(html_response, content_type='text/html')
+            
+        finally:
+            loop.close()
+
+    except ValueError as ve:
+        error_html = f"""<!DOCTYPE html>
+<html><head><title>Error</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h1>❌ User Not Found</h1><p>{str(ve)}</p></body></html>"""
+        return Response(error_html, content_type='text/html'), 404
+    except Exception as e:
+        print(f"Error in analyze_user: {e}")
+        error_html = f"""<!DOCTYPE html>
+<html><head><title>Error</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h1>❌ Internal Server Error</h1><p>{str(e)}</p></body></html>"""
+        return Response(error_html, content_type='text/html'), 500
+
+@app.route('/analyze_user_json', methods=['POST'])
+def analyze_user_json():
+    """Alternative endpoint that returns JSON (for compatibility)"""
+    try:
+        data = request.get_json()
+        username = data.get("username")
+        if not username:
+            return jsonify({"error": "Missing username in request body"}), 400
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(analyze_user_emotion_evidence_based_langchain(username))
+            return jsonify(result)
+        finally:
+            loop.close()
+
+    except Exception as e:
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "analysis_method": "langchain_evidence_based_html_output_with_exciting_vibe",
+        "framework": "LangChain + ChatGroq + Vibe Analyst",
+        "output_format": "HTML with Lottie animations + Exciting Vibe",
+        "vibe_style": "celebrity_analyst_engaging_context",
+        "pronouns": "male_pronouns_only",
+        "model": GROQ_MODEL,
+        "emotion_categories": len(EMOTION_CATEGORIES),
+        "flow": "Evidence → Categories → Synthesis → 🔥 Vibe Analysis → HTML",
+        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    })
+
+@app.route('/categories', methods=['GET'])
+def get_emotion_categories():
+    """Get available emotion categories"""
+    return jsonify({
+        "emotion_categories": EMOTION_CATEGORIES,
+        "total_categories": len(EMOTION_CATEGORIES)
+    })
+
+if __name__ == '__main__':
+    print("Starting LangChain Evidence-Based Emotion Analysis Server with Exciting Vibe HTML Output...")
+    print(f"Configured with {len(EMOTION_CATEGORIES)} emotion categories")
+    print("Using LangChain + ChatGroq with async parallel processing + Exciting Vibe Analysis")
+    print("Output Format: HTML with Lottie animations + Celebrity-style vibe context")
+    print("Framework: LangChain chains with structured prompts + Vibe Analyst")
+    print("🔥 NEW: Exciting vibe context with emojis and engaging narratives!")
+    print("Format: Evidence → Categories → Synthesis → 🌟 EXCITING VIBE ANALYSIS 🌟 → HTML")
+    print("Display: Emotion Timeline + Exciting Vibe (no detailed breakdowns)")
+    print("Main endpoint: POST /analyze_user (returns HTML)")
+    print("JSON endpoint: POST /analyze_user_json (returns JSON)")
+    app.run(debug=True, port=5000)
